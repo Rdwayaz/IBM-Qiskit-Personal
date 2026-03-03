@@ -1,0 +1,613 @@
+"""
+╔══════════════════════════════════════════════════════════╗
+║   ⚛️   VQE MOLECULAR SIMULATION BENCHMARK               ║
+║        Quantum vs Classical — Head to Head              ║
+║        Powered by IBM Qiskit                            ║
+╠══════════════════════════════════════════════════════════╣
+║                                                          ║
+║  WHAT IS VQE?                                            ║
+║  Variational Quantum Eigensolver — finds the lowest      ║
+║  energy state (ground state) of a molecule.              ║
+║                                                          ║
+║  WHY DOES THIS MATTER?                                   ║
+║  Simulating molecules is critical for:                   ║
+║    • Drug discovery (pharma companies spend $billions)   ║
+║    • Battery design (EV revolution)                      ║
+║    • Fertilizer chemistry (feeds the world)              ║
+║    • Superconductor research                             ║
+║                                                          ║
+║  WHY IS IT HARD?                                         ║
+║  A molecule with N electrons needs 2^N quantum states    ║
+║  to describe exactly. Classical computers run out of     ║
+║  memory fast. A 300-electron molecule would need more    ║
+║  bits than atoms in the observable universe.             ║
+║  Quantum computers encode this NATURALLY — one qubit     ║
+║  per electron orbital.                                   ║
+║                                                          ║
+║  OUR MOLECULE: H₂ (Hydrogen)                             ║
+║  The simplest molecule. 2 electrons, 2 orbitals.         ║
+║  Small enough to verify against exact classical answer,  ║
+║  but the same algorithm scales to caffeine, penicillin,  ║
+║  and beyond — where classical methods fail.              ║
+║                                                          ║
+║  Requirements:                                           ║
+║    pip install qiskit qiskit-ibm-runtime scipy numpy     ║
+║                                                          ║
+║  Setup for real hardware:                                ║
+║    1. Go to https://quantum.ibm.com → free account       ║
+║    2. Paste your API token below 
+╚══════════════════════════════════════════════════════════╝
+"""
+
+import time
+import math
+import argparse
+import sys
+import numpy as np
+from scipy.optimize import minimize
+from scipy.linalg import eigh
+
+from qiskit import QuantumCircuit, transpile
+from qiskit.quantum_info import SparsePauliOp, Statevector
+from qiskit.primitives import StatevectorEstimator
+from qiskit_ibm_runtime.fake_provider import FakeManilaV2
+from qiskit_ibm_runtime import (
+    QiskitRuntimeService,
+    EstimatorV2 as Estimator,
+    Session,
+)
+
+# ─────────────────────────────────────────────────────────
+#  CLI ARGUMENTS
+#
+#  Usage:
+#    python quantum_vqe_benchmark.py                   # simulator only
+#    python quantum_vqe_benchmark.py -T your_token     # + real hardware
+#    python quantum_vqe_benchmark.py -T token -i 100   # 100 VQE steps
+#    python quantum_vqe_benchmark.py -T token --sim-only
+#    Note: 
+#    Probably waste your quota in the single job submit, BEWARE
+# ─────────────────────────────────────────────────────────
+
+import argparse as _ap
+
+def _parse_args():
+    p = _ap.ArgumentParser(
+        prog="quantum_vqe_benchmark.py",
+        description="VQE Molecular Simulation — Quantum vs Classical",
+        formatter_class=_ap.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python quantum_vqe_benchmark.py                     # simulator only\n"
+            "  python quantum_vqe_benchmark.py -T tokentokentoken  # + real IBM hw\n"
+            "  python quantum_vqe_benchmark.py -T mytoken -i 100   # 100 iterations\n"
+            "  python quantum_vqe_benchmark.py -T mytoken --sim-only\n"
+        )
+    )
+    p.add_argument("-T", "--token", metavar="IBM_TOKEN", default=None,
+                   help="IBM Quantum API token (quantum.ibm.com/account)")
+    p.add_argument("--sim-only", action="store_true", default=False,
+                   help="Simulator only, even if token is provided")
+    p.add_argument("-i", "--iterations", metavar="N", type=int, default=50,
+                   help="Max VQE iterations per stage (default: 50)")
+    return p.parse_args()
+
+_args             = _parse_args()
+IBM_TOKEN         = _args.token or "YOUR_IBM_TOKEN"
+USE_REAL_HARDWARE = (_args.token is not None) and (not _args.sim_only)
+MAX_ITERATIONS    = _args.iterations
+CONVERGENCE_TOL   = 1e-6
+
+
+# ─────────────────────────────────────────────────────────
+#  THE H₂ HAMILTONIAN
+#
+#  The H₂ molecule's energy operator written as a sum of
+#  Pauli matrices (the language quantum computers speak).
+#  These coefficients come from quantum chemistry calculations
+#  at equilibrium bond length (0.735 Å) in STO-3G basis.
+#
+#  H = g₀·II + g₁·ZI + g₂·IZ + g₃·ZZ + g₄·XX + g₅·YY
+#
+#  Exact ground state energy: -1.8572 Hartree
+#  (1 Hartree = 27.211 eV = enough energy to ionise hydrogen)
+# ─────────────────────────────────────────────────────────
+
+H2_PAULI_TERMS = [
+    ("II", -1.0523732),
+    ("ZI",  0.3979374),
+    ("IZ", -0.3979374),
+    ("ZZ", -0.0112801),
+    ("XX",  0.1809312),
+    ("YY",  0.1809312),
+]
+EXACT_GROUND_STATE_ENERGY = -1.8572   # Hartree (known from quantum chemistry)
+MOLECULE_NAME = "H₂ (Hydrogen molecule)"
+
+
+# ─────────────────────────────────────────────────────────
+#  DISPLAY HELPERS
+# ─────────────────────────────────────────────────────────
+
+def banner(text):
+    w = 58
+    print("\n╔" + "═"*(w-2) + "╗")
+    for line in text.strip().split("\n"):
+        print(f"║  {line:<{w-4}}║")
+    print("╚" + "═"*(w-2) + "╝")
+
+def section(title):
+    print(f"\n  ┌─ {title}")
+    print(f"  │")
+
+def result_row(label, value, unit="", highlight=False):
+    marker = " ◀" if highlight else ""
+    print(f"  │   {label:<28} {value}{unit}{marker}")
+
+def divider():
+    print(f"  │")
+
+def endsection():
+    print(f"  └{'─'*50}")
+
+
+# ─────────────────────────────────────────────────────────
+#  BUILD THE HAMILTONIAN
+# ─────────────────────────────────────────────────────────
+
+def build_hamiltonian():
+    """Build the H₂ Hamiltonian as a SparsePauliOp (Qiskit format)
+    and as a dense numpy matrix (for classical exact diagonalisation)."""
+
+    pauli_list = [(term, coeff) for term, coeff in H2_PAULI_TERMS]
+    hamiltonian = SparsePauliOp.from_list(pauli_list)
+
+    # Also build the 4×4 matrix for classical exact solving
+    # Pauli matrices
+    I  = np.eye(2)
+    X  = np.array([[0, 1], [1, 0]])
+    Y  = np.array([[0, -1j], [1j, 0]])
+    Z  = np.array([[1, 0], [0, -1]])
+    paulis = {"I": I, "X": X, "Y": Y, "Z": Z}
+
+    matrix = np.zeros((4, 4), dtype=complex)
+    for term, coeff in H2_PAULI_TERMS:
+        p1, p2 = paulis[term[0]], paulis[term[1]]
+        matrix += coeff * np.kron(p1, p2)
+
+    return hamiltonian, matrix
+
+
+# ─────────────────────────────────────────────────────────
+#  THE ANSATZ CIRCUIT
+#
+#  An "ansatz" is a quantum circuit with tunable angles (θ).
+#  VQE searches for the angles that minimise the energy.
+#  This is the Ry-CNOT hardware-efficient ansatz —
+#  simple enough to run on today's noisy quantum chips.
+#
+#  Circuit diagram:
+#  q0: ─[Ry(θ₀)]──●──[Ry(θ₂)]─
+#                  │
+#  q1: ─[Ry(θ₁)]──⊕──[Ry(θ₃)]─
+# ─────────────────────────────────────────────────────────
+
+def build_ansatz(params):
+    """Build a 2-qubit variational circuit with 4 parameters."""
+    qc = QuantumCircuit(2)
+    qc.ry(params[0], 0)
+    qc.ry(params[1], 1)
+    qc.cx(0, 1)            # CNOT — creates entanglement between qubits
+    qc.ry(params[2], 0)
+    qc.ry(params[3], 1)
+    return qc
+
+
+# ─────────────────────────────────────────────────────────
+#  ① CLASSICAL EXACT SOLUTION
+#  Diagonalise the Hamiltonian matrix to find exact energies.
+#  This is the "gold standard" — but scales exponentially.
+# ─────────────────────────────────────────────────────────
+
+def run_classical_exact(matrix):
+    section("① CLASSICAL — Exact Diagonalisation")
+    print(f"  │   Method : numpy linear algebra (eigh)")
+    print(f"  │   Molecule: {MOLECULE_NAME}")
+    print(f"  │   Matrix  : 4×4 (2 qubits = 2² states)")
+    divider()
+
+    t0 = time.time()
+    eigenvalues, eigenvectors = eigh(matrix)   # find ALL energy levels
+    classical_time = time.time() - t0
+
+    ground_state_energy  = eigenvalues[0].real
+    excited_state_energy = eigenvalues[1].real
+    energy_gap           = excited_state_energy - ground_state_energy
+    error                = abs(ground_state_energy - EXACT_GROUND_STATE_ENERGY)
+
+    print(f"  │   All energy levels found:")
+    for i, e in enumerate(eigenvalues):
+        label = "← ground state" if i == 0 else f"excited state {i}"
+        print(f"  │     E{i} = {e.real:>10.6f} Ha   {label}")
+
+    divider()
+    result_row("Ground state energy",  f"{ground_state_energy:.6f}", " Ha", highlight=True)
+    result_row("Known exact value",    f"{EXACT_GROUND_STATE_ENERGY:.6f}", " Ha")
+    result_row("Error",                f"{error:.2e}", " Ha")
+    result_row("Energy gap (E1-E0)",   f"{energy_gap:.6f}", " Ha")
+    result_row("Time",                 f"{classical_time*1000:.3f}", " ms")
+    endsection()
+
+    print(f"""
+  ℹ️  Why this gets impossible fast:
+     H₂  (2 electrons)  →   4×4 matrix  ✅ trivial
+     H₂O (10 electrons) →  1024×1024    ✅ manageable
+     Caffeine (102 e⁻)  →  2^102 × 2^102  ❌ more entries
+                            than atoms in the universe
+    """)
+
+    return ground_state_energy, classical_time
+
+
+# ─────────────────────────────────────────────────────────
+#  ② CLASSICAL VQE SIMULATION
+#  Run VQE but cheat — use statevector maths instead of
+#  a real quantum chip. Same algorithm, no quantum noise.
+# ─────────────────────────────────────────────────────────
+
+def run_classical_vqe(hamiltonian):
+    section("② CLASSICAL VQE SIMULATION (statevector)")
+    print(f"  │   Method : VQE with exact statevector backend")
+    print(f"  │   Ansatz : Ry-CNOT-Ry (4 parameters)")
+    print(f"  │   Optimiser: COBYLA (gradient-free)")
+    divider()
+
+    estimator   = StatevectorEstimator()
+    energy_log  = []
+    iteration   = [0]
+
+    def energy_fn(params):
+        """Compute ⟨ψ(θ)|H|ψ(θ)⟩ — the expected energy for these angles."""
+        qc  = build_ansatz(params)
+        pub = (qc, hamiltonian)
+        job = estimator.run([pub])
+        energy = job.result()[0].data.evs.item()
+        energy_log.append(energy)
+        iteration[0] += 1
+        if iteration[0] % 10 == 0:
+            print(f"  │   Step {iteration[0]:>3}: energy = {energy:.6f} Ha")
+        return energy
+
+    # Random starting angles
+    np.random.seed(42)
+    init_params = np.random.uniform(0, 2*np.pi, 4)
+    print(f"  │   Starting energy: {energy_fn(init_params):.6f} Ha")
+    divider()
+
+    t0 = time.time()
+    result = minimize(
+        energy_fn,
+        init_params,
+        method="COBYLA",
+        options={"maxiter": MAX_ITERATIONS, "rhobeg": 0.5}
+    )
+    vqe_time = time.time() - t0
+
+    final_energy = result.fun
+    error        = abs(final_energy - EXACT_GROUND_STATE_ENERGY)
+
+    divider()
+    result_row("Ground state energy",  f"{final_energy:.6f}", " Ha", highlight=True)
+    result_row("Known exact value",    f"{EXACT_GROUND_STATE_ENERGY:.6f}", " Ha")
+    result_row("Error",                f"{error:.6f}", " Ha")
+    result_row("VQE iterations",       f"{iteration[0]}")
+    result_row("Converged",            "Yes" if result.success else "Partial")
+    result_row("Time",                 f"{vqe_time:.3f}", " s")
+    endsection()
+
+    return final_energy, vqe_time, result.x, energy_log   # return best params
+
+
+# ─────────────────────────────────────────────────────────
+#  ③ QUANTUM VQE — SIMULATOR (FakeManilaV2)
+#  Same VQE, but now circuits run on a fake quantum chip
+#  that models REAL noise, gate errors, and decoherence.
+# ─────────────────────────────────────────────────────────
+
+def run_quantum_vqe_simulator(hamiltonian, warm_params):
+    section("③ QUANTUM VQE — Noisy Simulator (FakeManilaV2)")
+    print(f"  │   Backend: FakeManilaV2 (IBM Manila noise model)")
+    print(f"  │   Shots  : 1024 per energy evaluation")
+    print(f"  │   Note   : Includes real gate errors & decoherence")
+    print(f"  │   Warm start: using best params from step ②")
+    divider()
+
+    backend   = FakeManilaV2()
+    estimator = Estimator(backend)
+    energy_log = []
+    iteration  = [0]
+
+    def energy_fn(params):
+        qc  = build_ansatz(params)
+        qc_t = transpile(qc, backend, optimization_level=1)
+        pub  = (qc_t, hamiltonian)
+        job  = estimator.run([pub])
+        energy = job.result()[0].data.evs.item()
+        energy_log.append(energy)
+        iteration[0] += 1
+        if iteration[0] % 5 == 0:
+            print(f"  │   Step {iteration[0]:>3}: energy = {energy:.6f} Ha")
+        return energy
+
+    print(f"  │   Starting energy (warm): {energy_fn(warm_params):.6f} Ha")
+    divider()
+
+    t0 = time.time()
+    result = minimize(
+        energy_fn,
+        warm_params,
+        method="COBYLA",
+        options={"maxiter": MAX_ITERATIONS, "rhobeg": 0.1}
+    )
+    sim_time = time.time() - t0
+
+    final_energy = result.fun
+    error        = abs(final_energy - EXACT_GROUND_STATE_ENERGY)
+
+    divider()
+    result_row("Ground state energy",  f"{final_energy:.6f}", " Ha", highlight=True)
+    result_row("Known exact value",    f"{EXACT_GROUND_STATE_ENERGY:.6f}", " Ha")
+    result_row("Error (with noise)",   f"{error:.6f}", " Ha")
+    result_row("VQE iterations",       f"{iteration[0]}")
+    result_row("Time",                 f"{sim_time:.3f}", " s")
+    endsection()
+
+    print(f"""
+  ℹ️  Notice the error is LARGER than step ②.
+     That's quantum noise in action — real chips make mistakes.
+     Error mitigation techniques (ZNE, PEC) can reduce this.
+     IBM's real hardware adds even more noise — but also gives
+     true quantum parallelism that no simulator can fake.
+    """)
+
+    return final_energy, sim_time, energy_log
+
+
+# ─────────────────────────────────────────────────────────
+#  ④ QUANTUM VQE — REAL IBM HARDWARE
+# ─────────────────────────────────────────────────────────
+
+def run_quantum_vqe_real_hardware(hamiltonian, warm_params):
+    section("④ QUANTUM VQE — Real IBM Quantum Hardware")
+    print(f"  │   Connecting to IBM Quantum platform...")
+
+    try:
+        service = QiskitRuntimeService(
+            channel="ibm_quantum_platform",
+            token=IBM_TOKEN
+        )
+        backend = service.least_busy(operational=True, simulator=False)
+        print(f"  │   ✅ Connected to: {backend.name}")
+        print(f"  │   Qubits available: {backend.num_qubits}")
+        divider()
+    except Exception as e:
+        print(f"  │   ❌ Could not connect: {e}")
+        endsection()
+        return None, None, []
+
+    energy_log = []
+    iteration  = [0]
+
+    with Session(backend=backend) as session:
+        estimator = Estimator(session=session)
+
+        def energy_fn(params):
+            qc   = build_ansatz(params)
+            qc_t = transpile(qc, backend, optimization_level=3)  # highest opt for real hw
+            pub  = (qc_t, hamiltonian)
+            job  = estimator.run([pub])
+            energy = job.result()[0].data.evs.item()
+            energy_log.append(energy)
+            iteration[0] += 1
+            print(f"  │   Step {iteration[0]:>3}: energy = {energy:.6f} Ha  [real quantum chip]")
+            return energy
+
+        print(f"  │   Warm start energy: {energy_fn(warm_params):.6f} Ha")
+        divider()
+
+        t0 = time.time()
+        result = minimize(
+            energy_fn,
+            warm_params,
+            method="COBYLA",
+            options={"maxiter": 20, "rhobeg": 0.1}   # fewer iterations on real hw (costs quota)
+        )
+        hw_time = time.time() - t0
+
+    final_energy = result.fun
+    error        = abs(final_energy - EXACT_GROUND_STATE_ENERGY)
+
+    divider()
+    result_row("Ground state energy",  f"{final_energy:.6f}", " Ha", highlight=True)
+    result_row("Known exact value",    f"{EXACT_GROUND_STATE_ENERGY:.6f}", " Ha")
+    result_row("Error (real hw noise)",f"{error:.6f}", " Ha")
+    result_row("VQE iterations",       f"{iteration[0]}")
+    result_row("Time (inc. queue)",    f"{hw_time:.1f}", " s")
+    endsection()
+
+    return final_energy, hw_time, energy_log
+
+
+# ─────────────────────────────────────────────────────────
+#  CONVERGENCE CHART (ASCII)
+# ─────────────────────────────────────────────────────────
+
+def print_convergence_chart(classical_log, sim_log, hw_log=None):
+    banner("📈  CONVERGENCE CHART\n   Energy vs VQE Iteration")
+
+    all_logs = [("Classical VQE", classical_log, "▲"),
+                ("Noisy Sim VQE", sim_log,       "●")]
+    if hw_log:
+        all_logs.append(("Real HW VQE", hw_log, "◆"))
+
+    chart_height = 10
+    chart_width  = 50
+    target       = EXACT_GROUND_STATE_ENERGY
+
+    for label, log, marker in all_logs:
+        if not log:
+            continue
+        # Downsample to chart_width points
+        step = max(1, len(log) // chart_width)
+        samples = log[::step][:chart_width]
+
+        min_e = min(samples + [target]) - 0.05
+        max_e = max(samples) + 0.05
+
+        print(f"\n  {label}  (target = {target:.4f} Ha)")
+        print(f"  {'─'*chart_width}")
+
+        for row in range(chart_height, -1, -1):
+            threshold = min_e + (max_e - min_e) * row / chart_height
+            if row == chart_height or row == 0:
+                y_label = f"{threshold:>7.4f} |"
+            elif abs(threshold - target) < (max_e - min_e) / chart_height:
+                y_label = f"  exact ┤"   # mark exact line
+            else:
+                y_label = f"        |"
+
+            line = ""
+            for i, e in enumerate(samples):
+                if abs(e - threshold) < (max_e - min_e) / chart_height:
+                    line += marker
+                else:
+                    line += " "
+            print(f"  {y_label}{line}")
+
+        print(f"  {'':>8} └{'─'*chart_width}")
+        print(f"  {'':>9}  iteration →")
+
+
+# ─────────────────────────────────────────────────────────
+#  FINAL COMPARISON TABLE
+# ─────────────────────────────────────────────────────────
+
+def print_final_comparison(exact_e, exact_t,
+                            cvqe_e, cvqe_t,
+                            svqe_e, svqe_t,
+                            hvqe_e=None, hvqe_t=None):
+    banner("🏆  FINAL RESULTS COMPARISON\n   H₂ Ground State Energy")
+
+    w = 56
+    print(f"\n  {'Method':<24} {'Energy (Ha)':>12} {'Error':>10} {'Time':>10}")
+    print(f"  {'─'*w}")
+
+    rows = [
+        ("① Classical Exact",   exact_e, exact_t),
+        ("② Classical VQE",     cvqe_e,  cvqe_t),
+        ("③ Noisy Sim VQE",     svqe_e,  svqe_t),
+    ]
+    if hvqe_e is not None:
+        rows.append(("④ Real Quantum HW",  hvqe_e, hvqe_t))
+
+    for label, energy, t in rows:
+        err  = abs(energy - EXACT_GROUND_STATE_ENERGY)
+        t_str = f"{t*1000:.1f}ms" if t < 1 else f"{t:.1f}s"
+        print(f"  {label:<24} {energy:>12.6f} {err:>10.2e} {t_str:>10}")
+
+    print(f"  {'─'*w}")
+    print(f"  {'Known exact value':<24} {EXACT_GROUND_STATE_ENERGY:>12.6f} {'—':>10} {'—':>10}")
+
+    print(f"""
+  KEY TAKEAWAYS
+  ─────────────
+  ① Classical Exact    — Perfect answer. Works only for tiny molecules.
+  ② Classical VQE      — Finds the same answer by guessing and improving.
+                         Same algorithm quantum computers use.
+  ③ Noisy Sim VQE     — Models a real quantum chip's imperfections.
+                         Error is larger — this is real quantum noise.
+  ④ Real Quantum HW   — True quantum superposition & entanglement.
+                         Noise is highest, but the physics is real.
+
+  WHY BOTHER WITH QUANTUM IF IT'S LESS ACCURATE?
+  ───────────────────────────────────────────────
+  For H₂ with 2 electrons — classical wins easily.
+  For a drug molecule with 100+ electrons:
+    Classical exact → ❌ physically impossible
+    Quantum VQE     → ✅ runs natively, same circuit depth
+
+  This is the quantum advantage — not speed on small problems,
+  but the ABILITY TO SOLVE problems classical computers cannot.
+
+  Real-world impact today:
+    • IBM & Pfizer: protein folding for drug discovery
+    • BMW & Airbus: battery material simulation
+    • BASF: catalyst design for fertiliser production
+    """)
+
+
+# ─────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────
+
+def main():
+    banner(
+        "⚛️   VQE MOLECULAR SIMULATION BENCHMARK\n"
+        "   Quantum vs Classical — Head to Head\n"
+        f"   Molecule: {MOLECULE_NAME}"
+    )
+
+    # ── Show active config ──────────────────────────────
+    print(f"  ⚙️  Configuration:")
+    print(f"     Token provided : {'✅ Yes' if _args.token else '❌ No'}")
+    print(f"     Real hardware  : {'✅ Will connect to IBM' if USE_REAL_HARDWARE else '🖥️  Simulator only'}")
+    print(f"     VQE iterations : {MAX_ITERATIONS}")
+    if not _args.token:
+        print(f"")
+        print(f"  💡 Tip: add -T your_token to also run on real IBM hardware")
+        print(f"         python quantum_vqe_benchmark.py -T tokentokentoken")
+
+    print(f"""
+  THE PLAN:
+    ① Classical exact diagonalisation (the cheat sheet)
+    ② Classical VQE simulation       (no quantum noise)
+    ③ Quantum VQE — noisy simulator  (real noise model)
+    ④ Quantum VQE — real IBM chip    (if token provided)
+
+  All four methods solve THE SAME PROBLEM:
+  "What is the ground state energy of H₂?"
+  Answer: {EXACT_GROUND_STATE_ENERGY} Hartree
+    """)
+
+    # Build the Hamiltonian once
+    hamiltonian, h_matrix = build_hamiltonian()
+
+    print(f"  H₂ Hamiltonian (Pauli decomposition):")
+    for term, coeff in H2_PAULI_TERMS:
+        sign = "+" if coeff >= 0 else "-"
+        print(f"    {sign} {abs(coeff):.7f} · {term}")
+
+    # ── Run all methods ──────────────────────────────────
+    exact_e, exact_t = run_classical_exact(h_matrix)
+
+    cvqe_e, cvqe_t, best_params, cvqe_log = run_classical_vqe(hamiltonian)
+
+    svqe_e, svqe_t, svqe_log = run_quantum_vqe_simulator(hamiltonian, best_params)
+
+    hvqe_e, hvqe_t, hvqe_log = None, None, []
+    if USE_REAL_HARDWARE:
+        hvqe_e, hvqe_t, hvqe_log = run_quantum_vqe_real_hardware(hamiltonian, best_params)
+
+    # ── Display charts and summary ───────────────────────
+    print_convergence_chart(cvqe_log, svqe_log, hvqe_log or None)
+
+    print_final_comparison(
+        exact_e, exact_t,
+        cvqe_e,  cvqe_t,
+        svqe_e,  svqe_t,
+        hvqe_e,  hvqe_t,
+    )
+
+
+if __name__ == "__main__":
+    main()
